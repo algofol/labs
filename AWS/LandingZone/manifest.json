@@ -1,0 +1,29 @@
+{
+  "governedRegions": ["us-east-1"],
+  "organizationStructure": {
+    "security": {
+      "name": "Security"
+    },
+    "sandbox": {
+      "name": "Sandbox"
+    }
+  },
+  "centralizedLogging": {
+    "accountId": "651026612795",
+    "configurations": {
+      "loggingBucket": {
+        "retentionDays": 60
+      },
+      "accessLoggingBucket": {
+        "retentionDays": 60
+      }
+    },
+    "enabled": true
+  },
+  "securityRoles": {
+    "accountId": "142105517357"
+  },
+  "accessManagement": {
+    "enabled": true
+  }
+}

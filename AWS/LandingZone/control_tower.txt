@@ -10,4 +10,232 @@ aws organizations create-organization --feature-set ALL
 aws organizations list-roots
 aws controltower list-landing-zones
 
+# Create Log Archive and Audit accounts
+# These account are created first but they will be moved my control tower later on
+# OUs are not created yet since they are managed by CT, otherwise they would need to be registered
+aws organizations create-account --email logarchive@example.com --account-name "Log Archive"
+aws organizations create-account --email audit@example.com --account-name "Audit"
 
+# Verify
+aws organizations list-accounts --query "Accounts[].[Name,Id,Status]" --output table
+
+export ROOT_ID=$(aws organizations list-roots --query "Roots[0].Id" --output text)
+export LOG_ID=$(aws organizations list-accounts --query "Accounts[?Name=='Log Archive'].Id | [0]" --output text)
+export AUDIT_ID=$(aws organizations list-accounts --query "Accounts[?Name=='Audit'].Id | [0]" --output text)
+
+# Create ControlTowerAdmin Role
+aws iam create-role \
+  --role-name AWSControlTowerAdmin \
+  --path /service-role/ \
+  --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "controltower.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}'
+
+# Attach policy AWSControlTowerServiceRolePolicy to role AWSControlTowerAdmin 
+aws iam attach-role-policy \
+  --role-name AWSControlTowerAdmin \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSControlTowerServiceRolePolicy
+
+# Add inline policy AWSControlTowerAdminPolicy to role AWSControlTowerAdmin
+aws iam put-role-policy \
+  --role-name AWSControlTowerAdmin \
+  --policy-name AWSControlTowerAdminPolicy \
+  --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "ec2:DescribeAvailabilityZones",
+      "Resource": "*"
+    }
+  ]
+}'
+
+# Verify (CT needs to know every AZ or every region)
+aws iam list-attached-role-policies --role-name AWSControlTowerAdmin
+aws iam list-role-policies --role-name AWSControlTowerAdmin
+
+# Same for AWSControlTowerCloudTrailRole, CT needs an Ord Trail on CloudTrail that sends events to
+# S3(LogArchive) and to a CloudWatch Logs called aws-controltower/CloudTrailLogs
+
+aws iam create-role \
+  --role-name AWSControlTowerCloudTrailRole \
+  --path /service-role/ \
+  --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudtrail.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}'
+
+aws iam put-role-policy \
+  --role-name AWSControlTowerCloudTrailRole \
+  --policy-name AWSControlTowerCloudTrailRolePolicy \
+  --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": [
+        "logs:CreateLogStream",
+        "logs:PutLogEvents"
+      ],
+      "Resource": "arn:aws:logs:*:*:log-group:aws-controltower/CloudTrailLogs:*"
+    }
+  ]
+}'
+
+# Create an AWSControlTowerStackSetRole role
+# CT deploys resources on member accounts through CloudFormation StackSets, CF assumes this role in
+# management account and then AWSControlTowerExecution role inside every member account. Avoiding the
+# need of permanent credentials in member accounts
+aws iam create-role \
+  --role-name AWSControlTowerStackSetRole \
+  --path /service-role/ \
+  --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "cloudformation.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}'
+
+aws iam put-role-policy \
+  --role-name AWSControlTowerStackSetRole \
+  --policy-name AWSControlTowerStackSetRolePolicy \
+  --policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": "sts:AssumeRole",
+      "Resource": "arn:aws:iam::*:role/AWSControlTowerExecution"
+    }
+  ]
+}'
+
+# Create AWSControlTowerConfigAggregatorRoleForOrganizations role
+# CT adds an AWS Config aggregator to check compliance of every member account centrally. Config 
+# needs permission to list Organization accounts
+aws iam create-role \
+  --role-name AWSControlTowerConfigAggregatorRoleForOrganizations \
+  --path /service-role/ \
+  --assume-role-policy-document '{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Principal": {
+        "Service": "config.amazonaws.com"
+      },
+      "Action": "sts:AssumeRole"
+    }
+  ]
+}'
+
+aws iam attach-role-policy \
+  --role-name AWSControlTowerConfigAggregatorRoleForOrganizations \
+  --policy-arn arn:aws:iam::aws:policy/service-role/AWSConfigRoleForOrganizations
+
+# Verify all roles created up to now
+aws iam list-roles \
+  --path-prefix /service-role/ \
+  --query "Roles[].[RoleName,Arn]" \
+  --output table
+
+
+# Create the Landing Zone manifest
+cat > manifest.json << 'EOF'
+{
+  "governedRegions": ["us-east-1"],
+  "organizationStructure": {
+    "security": {
+      "name": "Security"
+    },
+    "sandbox": {
+      "name": "Sandbox"
+    }
+  },
+  "centralizedLogging": {
+    "accountId": "651026612795",
+    "configurations": {
+      "loggingBucket": {
+        "retentionDays": 60
+      },
+      "accessLoggingBucket": {
+        "retentionDays": 60
+      }
+    },
+    "enabled": true
+  },
+  "securityRoles": {
+    "accountId": "142105517357"
+  },
+  "accessManagement": {
+    "enabled": true
+  }
+}
+EOF
+
+# Create the Landing Zone(It will take 30-60 minutes)
+# This will create all the deployment in us-east-1, CT uses previously created roles to:
+# - create OUs
+# - move Log Archive and Audit into the Security OU
+# - deploy CloudTrail, Config, S3 and IAM Identity Center
+aws controltower create-landing-zone \
+  --landing-zone-version 3.3 \
+  --manifest file://manifest.json
+
+#Note down the output
+#{
+#    "arn": "arn:aws:controltower:us-east-1:000000000000:landingzone/22267d82e06a",
+#    "operationIdentifier": "eeae5d2a-1746-47f5-aa2c-8328d9386a38"
+#}
+
+# Verify LZ creation
+export LZ_ARN=$(aws controltower list-landing-zones --query "landingZones[0].arn" --output text)
+aws controltower get-landing-zone-operation --operation-identifier eeae5d2a-1746-47f5-aa2c-8328d9386a38
+aws controltower list-landing-zones
+aws controltower get-landing-zone --landing-zone-identifier $LZ_ARN
+aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID
+
+export SECURITY_OU_ID=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Security'].Id | [0]" --output text)
+export SANDBOX_OU_ID=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Sandbox'].Id | [0]" --output text)
+
+#### create Ous Manually, only for Floci NOT REAL AWS ENVIRONMENT!!!!
+#aws organizations create-organizational-unit --parent-id $ROOT_ID --name Security
+#aws organizations create-organizational-unit --parent-id $ROOT_ID --name Sandbox
+#
+#export SECURITY_OU_ID=$(aws organizations list-organizational-units-for-parent \
+#  --parent-id $ROOT_ID \
+#  --query "OrganizationalUnits[?Name=='Security'].Id | [0]" \
+#  --output text)
+#
+#export SANDBOX_OU_ID=$(aws organizations list-organizational-units-for-parent \
+#  --parent-id $ROOT_ID \
+#  --query "OrganizationalUnits[?Name=='Sandbox'].Id | [0]" \
+#  --output text)
+#
+#aws organizations move-account --account-id $LOG_ID --source-parent-id $ROOT_ID --destination-parent-id $SECURITY_OU_ID
+#aws organizations move-account --account-id $AUDIT_ID --source-parent-id $ROOT_ID --destination-parent-id $SECURITY_OU_ID
+#aws organizations list-accounts-for-parent --parent-id $SECURITY_OU_ID --query "Accounts[].[Name,Id]" --output table
