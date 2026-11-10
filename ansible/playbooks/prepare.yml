@@ -1,0 +1,24 @@
+---
+- name: Prepare Kubernetes nodes
+  hosts: kube_cluster
+  become: true
+  roles:
+    - common
+
+- name: Initialize Kubernetes control plane
+  hosts: kube_control_plane
+  become: true
+  roles:
+    - control_plane
+
+- name: Install Kubernetes cluster networking
+  hosts: kube_control_plane
+  become: true
+  roles:
+    - cni
+
+- name: Join Kubernetes worker nodes
+  hosts: kube_workers
+  become: true
+  roles:
+    - data_plane

@@ -1,0 +1,8 @@
+---
+registry_host: "{{ groups['kube_control_plane'][0] }}"
+registry_address: "{{ hostvars[registry_host].kubernetes_node_ip }}"
+registry_hostname: registry.lab.home.arpa
+registry_port: 5000
+registry_image: docker.io/library/registry:3.0.0
+registry_storage_dir: /var/lib/registry
+registry_config_dir: /etc/registry

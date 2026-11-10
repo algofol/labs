@@ -1,0 +1,42 @@
+##Install floci on Fedora 44(Cinnamon)
+
+# Remove legacy or preinstalled docker packages
+sudo dnf remove docker docker-client docker-client-latest docker-common docker-latest docker-latest-logrotate docker-logrotate docker-engine podman runc   
+
+# Install Docker from the official repo
+sudo dnf install dnf-plugins-core
+sudo dnf config-manager addrepo --from-repofile https://download.docker.com/linux/fedora/docker-ce.repo   
+sudo dnf install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+# Enable and test docker
+sudo systemctl enable --now docker
+sudo docker run hello-world   
+
+# Install
+curl -fsSL https://floci.io/install.sh | sh
+
+# Start Floci with persistent storage mode in /opt/floci, DO NOT USE "floci start"
+# because it will run in "FLOCI_STORAGE_MODE=memory" by default
+docker run -d \
+    --name floci \
+    -e FLOCI_STORAGE_MODE=persistent \
+    -e FLOCI_STORAGE_PERSISTENT_PATH=/app/data \
+    -p 4566:4566 \
+    -v /opt/floci:/app/data \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    floci/floci:latest
+
+# Export local endpoint variables
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+
+# Run the floci AWS-like dashboard
+sudo docker run -d --name floci-dash \
+  -p 9877:3000 \
+  --add-host=host.docker.internal:host-gateway \
+  ghcr.io/ofsazib/floci-dash:latest
+
+# Now go to http://localhost:9877, if you experience issues try the "Auto-detect Floci" button in the dash web
+# and then the dashboard endpoint is at http://localhost:3000

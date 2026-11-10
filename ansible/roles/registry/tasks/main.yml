@@ -1,0 +1,14 @@
+---
+- name: Validate registry role mode
+  ansible.builtin.assert:
+    that:
+      - registry_role_mode in ['server', 'clients']
+    fail_msg: "Set registry_role_mode to either 'server' or 'clients'."
+
+- name: Configure registry server
+  ansible.builtin.include_tasks: server.yml
+  when: registry_role_mode == 'server'
+
+- name: Configure registry clients
+  ansible.builtin.include_tasks: clients.yml
+  when: registry_role_mode == 'clients'

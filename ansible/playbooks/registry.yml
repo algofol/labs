@@ -1,0 +1,16 @@
+---
+- name: Deploy private container image registry
+  hosts: kube_control_plane
+  become: true
+  roles:
+    - role: registry
+      vars:
+        registry_role_mode: server
+
+- name: Configure Kubernetes nodes to use the registry
+  hosts: kube_cluster
+  become: true
+  roles:
+    - role: registry
+      vars:
+        registry_role_mode: clients

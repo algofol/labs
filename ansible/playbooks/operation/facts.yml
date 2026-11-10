@@ -1,0 +1,8 @@
+---
+- name: Obtener facts de los nodos Kubernetes
+  hosts: kube_cluster
+
+  tasks:
+    - name: Mostrar facts
+      ansible.builtin.debug:
+        var: ansible_facts

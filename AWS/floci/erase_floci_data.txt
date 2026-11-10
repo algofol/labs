@@ -1,0 +1,5 @@
+# First get where floci is storing persistent data in mounts section
+sudo docker inspect a8c0cb7d3096
+sudo docker stop a8c0cb7d3096
+sudo rm -f /opt/floci-data/*
+sudo rmdir /opt/floci-data/s3

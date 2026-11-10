@@ -1,0 +1,5 @@
+---
+- name: Join worker to Kubernetes cluster
+  ansible.builtin.command:
+    cmd: "{{ hostvars[kubernetes_control_plane_host].kubernetes_worker_join_command }}"
+    creates: /etc/kubernetes/kubelet.conf

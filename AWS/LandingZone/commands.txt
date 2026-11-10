@@ -1,0 +1,882 @@
+# Ejecutar todos los export para cargar configuracion de variables de un dia para otro
+# source <(grep '^export' AWS/LandingZone/commands.txt)
+
+export AWS_ENDPOINT_URL=http://localhost:4566
+export AWS_DEFAULT_REGION=us-east-1
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+export AWS_PAGER=""
+export ACCOUNT_MGMT=$(aws sts get-caller-identity --query Account --output text)
+export EMAIL_MGMT=$(aws organizations list-accounts --query "Accounts[?Id=='$ACCOUNT_MGMT'].Email" --output text)
+
+# Create organization
+aws organizations create-organization --feature-set ALL
+
+# Get Organization Root ID and export it as a variable
+export ROOT_ID=$(aws organizations list-roots --query 'Roots[].Id' --output text)
+
+# Create OUs
+aws organizations create-organizational-unit --parent-id $ROOT_ID --name Security
+aws organizations create-organizational-unit --parent-id $ROOT_ID --name Infrastructure
+aws organizations create-organizational-unit --parent-id $ROOT_ID --name Workloads
+aws organizations create-organizational-unit --parent-id $ROOT_ID --name Sandbox
+
+# Export OUs IDs
+export OU_SECURITY=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Security'].Id" --output text)
+export OU_INFRASTRUCTURE=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Infrastructure'].Id" --output text)
+export OU_WORKLOADS=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Workloads'].Id" --output text)
+export OU_SANDBOX=$(aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID --query "OrganizationalUnits[?Name=='Sandbox'].Id" --output text)
+
+# Check OU structure
+aws organizations list-organizational-units-for-parent --parent-id $ROOT_ID
+
+# Create accounts
+aws organizations create-account --email log-archive@example.com --account-name "Log Archive"
+aws organizations create-account --email audit@example.com --account-name "Audit"
+aws organizations create-account --email network@example.com --account-name "Network"
+aws organizations create-account --email shared@example.com --account-name "Shared"
+aws organizations create-account --email workload-dev@example.com --account-name "Workload DEV"
+aws organizations create-account --email workload-prod@example.com --account-name "Workload PROD"
+aws organizations create-account --email sandbox@example.com --account-name "Sandbox"
+
+# Export accounts IDs
+export ACCOUNT_LOG_ARCHIVE=$(aws organizations list-accounts --query "Accounts[?Name=='Log Archive'].Id" --output text)
+export ACCOUNT_AUDIT=$(aws organizations list-accounts --query "Accounts[?Name=='Audit'].Id" --output text)
+export ACCOUNT_NETWORK=$(aws organizations list-accounts --query "Accounts[?Name=='Network'].Id" --output text)
+export ACCOUNT_SHARED=$(aws organizations list-accounts --query "Accounts[?Name=='Shared'].Id" --output text)
+export ACCOUNT_DEV=$(aws organizations list-accounts --query "Accounts[?Name=='Workload DEV'].Id" --output text)
+export ACCOUNT_PROD=$(aws organizations list-accounts --query "Accounts[?Name=='Workload PROD'].Id" --output text)
+export ACCOUNT_SANDBOX=$(aws organizations list-accounts --query "Accounts[?Name=='Sandbox'].Id" --output text)
+
+# Move accounts into their respective OUs
+aws organizations move-account --account-id $ACCOUNT_LOG_ARCHIVE --source-parent-id $ROOT_ID --destination-parent-id $OU_SECURITY
+aws organizations move-account --account-id $ACCOUNT_AUDIT --source-parent-id $ROOT_ID --destination-parent-id $OU_SECURITY
+aws organizations move-account --account-id $ACCOUNT_NETWORK --source-parent-id $ROOT_ID --destination-parent-id $OU_INFRASTRUCTURE
+aws organizations move-account --account-id $ACCOUNT_SHARED --source-parent-id $ROOT_ID --destination-parent-id $OU_INFRASTRUCTURE
+aws organizations move-account --account-id $ACCOUNT_DEV --source-parent-id $ROOT_ID --destination-parent-id $OU_WORKLOADS
+aws organizations move-account --account-id $ACCOUNT_PROD --source-parent-id $ROOT_ID --destination-parent-id $OU_WORKLOADS
+aws organizations move-account --account-id $ACCOUNT_SANDBOX --source-parent-id $ROOT_ID --destination-parent-id $OU_SANDBOX
+
+# Check accounts by OU
+aws organizations list-accounts-for-parent --parent-id $OU_SECURITY
+aws organizations list-accounts-for-parent --parent-id $OU_INFRASTRUCTURE
+aws organizations list-accounts-for-parent --parent-id $OU_WORKLOADS
+aws organizations list-accounts-for-parent --parent-id $OU_SANDBOX
+
+# Create and attach SCPs
+aws organizations create-policy \
+  --name DenyLeaveOrganization \
+  --description "Denies leaving organization" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "DenyLeaveOrg",
+        "Effect": "Deny",
+        "Action": "organizations:LeaveOrganization",
+        "Resource": "*"
+      }
+    ]
+  }' \
+  --query 'Policy.PolicySummary.Id' \
+  --output text
+export DENYLEAVEORGANIZATION_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='DenyLeaveOrganization'].Id" --output text)
+aws organizations attach-policy --policy-id $DENYLEAVEORGANIZATION_POLICYID --target-id $ROOT_ID
+
+# Check SCPs applied to targets and targets affected by SCPs
+aws organizations list-targets-for-policy --policy-id $DENYLEAVEORGANIZATION_POLICYID   --query "Targets[].{Name:Name,Type:Type}" --output table
+aws organizations list-policies-for-target   --target-id $ROOT_ID   --filter SERVICE_CONTROL_POLICY   --query "Policies[].{Name:Name,Id:Id}" --output table
+
+# Enable trusted service access
+SERVICE_PRINCIPALS=(
+  cloudtrail.amazonaws.com
+  config.amazonaws.com
+  config-multiaccountsetup.amazonaws.com
+  guardduty.amazonaws.com
+  securityhub.amazonaws.com
+  access-analyzer.amazonaws.com
+  macie.amazonaws.com
+  inspector2.amazonaws.com
+  sso.amazonaws.com
+  ram.amazonaws.com
+  backup.amazonaws.com
+  member.org.stacksets.cloudformation.amazonaws.com
+  tagpolicies.tag.amazonaws.com
+  ipam.amazonaws.com
+)
+ 
+for sp in "${SERVICE_PRINCIPALS[@]}"; do
+  aws organizations enable-aws-service-access --service-principal "$sp"
+done
+
+# Verify
+aws organizations list-aws-service-access-for-organization   --query "EnabledServicePrincipals[].ServicePrincipal" --output table
+
+
+###############################################################################
+# Delegated administrators
+#   Audit   -> security/compliance services
+#   Network -> IPAM
+#   Shared  -> StackSets, Backup
+# GuardDuty, Security Hub, Macie and Inspector are delegated through their own
+# APIs (step 3), not with organizations register-delegated-administrator.
+###############################################################################
+
+# $1 account id, $2 service principal
+register_admin() {  
+  aws organizations register-delegated-administrator \
+    --account-id "$1" --service-principal "$2"
+}
+
+register_admin "$ACCOUNT_AUDIT"   config.amazonaws.com
+register_admin "$ACCOUNT_AUDIT"   config-multiaccountsetup.amazonaws.com
+register_admin "$ACCOUNT_AUDIT"   access-analyzer.amazonaws.com
+register_admin "$ACCOUNT_AUDIT"   cloudtrail.amazonaws.com
+register_admin "$ACCOUNT_NETWORK" ipam.amazonaws.com
+register_admin "$ACCOUNT_SHARED"  member.org.stacksets.cloudformation.amazonaws.com
+register_admin "$ACCOUNT_SHARED"  backup.amazonaws.com
+ 
+# Verify that member account can manage configured services as a delegated administrator
+for sp in config.amazonaws.com config-multiaccountsetup.amazonaws.com \
+          access-analyzer.amazonaws.com cloudtrail.amazonaws.com \
+          ipam.amazonaws.com member.org.stacksets.cloudformation.amazonaws.com \
+          backup.amazonaws.com; do
+  aws organizations list-delegated-administrators --service-principal "$sp" \
+    --query "DelegatedAdministrators[].[\`$sp\`,Name,Id]" --output text
+done | column -t
+
+
+
+# Delegate Audit as administrator, services are regional
+# add --region "xx-xxxxxxxx-x" to each command if needed
+aws guardduty enable-organization-admin-account --admin-account-id "$ACCOUNT_AUDIT"
+aws securityhub enable-organization-admin-account --admin-account-id "$ACCOUNT_AUDIT"
+aws macie2 enable-organization-admin-account --admin-account-id "$ACCOUNT_AUDIT"
+aws inspector2 enable-delegated-admin-account --delegated-admin-account-id "$ACCOUNT_AUDIT"
+
+# Verify (should show ENABLED)
+aws guardduty list-organization-admin-accounts
+aws securityhub list-organization-admin-accounts
+aws macie2 list-organization-admin-accounts
+aws inspector2 list-delegated-admin-accounts
+
+# Assume Audit organization role
+
+CREDS=$(aws sts assume-role \
+  --role-arn "arn:aws:iam::${ACCOUNT_AUDIT}:role/OrganizationAccountAccessRole" \
+  --role-session-name audit-setup \
+  --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+
+# Verify assumed role
+aws sts get-caller-identity
+
+# Configure GuardDuty
+aws guardduty create-detector --enable
+export DETECTOR_ID=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+
+# Auto-enable for new accounts
+aws guardduty update-organization-configuration --detector-id $DETECTOR_ID --auto-enable-organization-members ALL
+
+# Sign up existing accounts to GuardDuty
+aws guardduty create-members --detector-id $DETECTOR_ID --account-details \
+  AccountId=$ACCOUNT_MGMT,Email=$EMAIL_MGMT \
+  AccountId=$ACCOUNT_LOG_ARCHIVE,Email=log-archive@example.com \
+  AccountId=$ACCOUNT_NETWORK,Email=network@example.com \
+  AccountId=$ACCOUNT_SHARED,Email=shared@example.com \
+  AccountId=$ACCOUNT_DEV,Email=workload-dev@example.com \
+  AccountId=$ACCOUNT_PROD,Email=workload-prod@example.com \
+  AccountId=$ACCOUNT_SANDBOX,Email=sandbox@example.com
+aws guardduty list-members --detector-id $DETECTOR_ID --query 'Members[].[AccountId,Email,RelationshipStatus]' --output table
+
+# Enable SecurityHub from Audit account (maybe enabled by default)
+aws securityhub enable-security-hub --enable-default-standards
+
+# Auto-enable SecurityHub for new accounts
+aws securityhub update-organization-configuration --auto-enable --auto-enable-standards DEFAULT
+
+# Sign up existing accounts to SecurityHub (not supported yet in Floci)
+aws securityhub create-members --account-details \
+  AccountId=$ACCOUNT_MGMT,Email=$EMAIL_MGMT \
+  AccountId=$ACCOUNT_LOG_ARCHIVE,Email=log-archive@example.com \
+  AccountId=$ACCOUNT_NETWORK,Email=network@example.com \
+  AccountId=$ACCOUNT_SHARED,Email=shared@example.com \
+  AccountId=$ACCOUNT_DEV,Email=workload-dev@example.com \
+  AccountId=$ACCOUNT_PROD,Email=workload-prod@example.com \
+  AccountId=$ACCOUNT_SANDBOX,Email=sandbox@example.com
+
+# Enable Macie in Audit account (maybe enabled by default)
+aws macie2 enable-macie
+
+# Auto-enable Macie for new accounts
+aws macie2 update-organization-configuration --auto-enable
+
+# Sign up existing accounts to Macie (not supported yet in Floci)
+aws macie2 create-member --account accountId=$ACCOUNT_MGMT,email=$EMAIL_MGMT
+aws macie2 create-member --account accountId=$ACCOUNT_LOG_ARCHIVE,email=log-archive@example.com
+aws macie2 create-member --account accountId=$ACCOUNT_NETWORK,email=network@example.com
+aws macie2 create-member --account accountId=$ACCOUNT_SHARED,email=shared@example.com
+aws macie2 create-member --account accountId=$ACCOUNT_DEV,email=workload-dev@example.com
+aws macie2 create-member --account accountId=$ACCOUNT_PROD,email=workload-prod@example.com
+aws macie2 create-member --account accountId=$ACCOUNT_SANDBOX,email=sandbox@example.com
+
+# Verify (not supported yet in Floci)
+aws macie2 list-members --query 'members[].{Account:accountId,Status:relationshipStatus}' --output table
+
+# Auto-enable Inspector for new accounts from Audit account
+aws inspector2 update-organization-configuration --auto-enable ec2=true,ecr=true,lambda=true,lambdaCode=true
+
+# Enable scan in Audit and other existing accountss
+aws inspector2 enable --resource-types EC2 ECR LAMBDA LAMBDA_CODE --account-ids $ACCOUNT_AUDIT $ACCOUNT_MGMT $ACCOUNT_LOG_ARCHIVE $ACCOUNT_NETWORK $ACCOUNT_SHARED $ACCOUNT_DEV $ACCOUNT_PROD $ACCOUNT_SANDBOX
+
+# Verify (not supported yet in Floci)
+aws inspector2 list-members --query 'members[].{Account:accountId,Status:relationshipStatus}' --output table
+
+# Return to management role account
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+aws sts get-caller-identity
+
+#  Create SCPs (run only once, re-running fails because the names already exist)
+ 
+# DenyRootUser: denies every action performed by the root user of member accounts
+aws organizations create-policy \
+  --name DenyRootUser \
+  --description "Denies actions by the root user" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "DenyRootUser",
+        "Effect": "Deny",
+        "Action": "*",
+        "Resource": "*",
+        "Condition": {
+          "StringLike": {
+            "aws:PrincipalArn": "arn:aws:iam::*:root"
+          }
+        }
+      }
+    ]
+  }'
+ 
+# RestrictRegions: denies everything outside the allowed regions (global services excluded via NotAction)
+aws organizations create-policy \
+  --name RestrictRegions \
+  --description "Restricts usage to the allowed regions" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "DenyOutsideAllowedRegions",
+        "Effect": "Deny",
+        "NotAction": [
+          "iam:*",
+          "organizations:*",
+          "sts:*",
+          "sso:*",
+          "identitystore:*",
+          "account:*",
+          "support:*",
+          "budgets:*",
+          "ce:*",
+          "health:*",
+          "trustedadvisor:*",
+          "route53:*",
+          "route53domains:*",
+          "cloudfront:*",
+          "waf:*",
+          "wafv2:*"
+        ],
+        "Resource": "*",
+        "Condition": {
+          "StringNotEquals": {
+            "aws:RequestedRegion": [
+              "us-east-1"
+            ]
+          }
+        }
+      }
+    ]
+  }'
+ 
+# ProtectSecurityServices: prevents disabling CloudTrail, Config, GuardDuty, Security Hub and Access Analyzer
+aws organizations create-policy \
+  --name ProtectSecurityServices \
+  --description "Prevents disabling CloudTrail, Config, GuardDuty and Security Hub" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ProtectSecurityServices",
+        "Effect": "Deny",
+        "Action": [
+          "cloudtrail:StopLogging",
+          "cloudtrail:DeleteTrail",
+          "cloudtrail:UpdateTrail",
+          "cloudtrail:PutEventSelectors",
+          "config:DeleteConfigurationRecorder",
+          "config:DeleteDeliveryChannel",
+          "config:StopConfigurationRecorder",
+          "guardduty:DeleteDetector",
+          "guardduty:UpdateDetector",
+          "guardduty:DisassociateFromAdministratorAccount",
+          "guardduty:DisassociateFromMasterAccount",
+          "securityhub:DisableSecurityHub",
+          "securityhub:DisassociateFromAdministratorAccount",
+          "access-analyzer:DeleteAnalyzer"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }'
+ 
+# ProtectOrgAccessRole: protects OrganizationAccountAccessRole (the role itself is exempted)
+aws organizations create-policy \
+  --name ProtectOrgAccessRole \
+  --description "Protects OrganizationAccountAccessRole from modification" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "ProtectOrganizationAccountAccessRole",
+        "Effect": "Deny",
+        "Action": [
+          "iam:AttachRolePolicy",
+          "iam:DetachRolePolicy",
+          "iam:DeleteRole",
+          "iam:DeleteRolePolicy",
+          "iam:PutRolePolicy",
+          "iam:UpdateAssumeRolePolicy",
+          "iam:UpdateRole",
+          "iam:UpdateRoleDescription"
+        ],
+        "Resource": "arn:aws:iam::*:role/OrganizationAccountAccessRole",
+        "Condition": {
+          "StringNotLike": {
+            "aws:PrincipalArn": "arn:aws:iam::*:role/OrganizationAccountAccessRole"
+          }
+        }
+      }
+    ]
+  }'
+ 
+# DenyIAMUsers: denies IAM users and long-lived access keys
+aws organizations create-policy \
+  --name DenyIAMUsers \
+  --description "Denies IAM users and long-lived access keys" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "DenyIAMUsersAndAccessKeys",
+        "Effect": "Deny",
+        "Action": [
+          "iam:CreateUser",
+          "iam:CreateAccessKey",
+          "iam:CreateLoginProfile",
+          "iam:UpdateAccessKey"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }'
+ 
+# SandboxGuardrails: cost guardrails (only t3/t3a/t4g instances, no expensive services)
+aws organizations create-policy \
+  --name SandboxGuardrails \
+  --description "Cost guardrails for the Sandbox OU" \
+  --type SERVICE_CONTROL_POLICY \
+  --content '{
+    "Version": "2012-10-17",
+    "Statement": [
+      {
+        "Sid": "DenyLargeInstances",
+        "Effect": "Deny",
+        "Action": "ec2:RunInstances",
+        "Resource": "arn:aws:ec2:*:*:instance/*",
+        "Condition": {
+          "StringNotLike": {
+            "ec2:InstanceType": [
+              "t3.*",
+              "t3a.*",
+              "t4g.*"
+            ]
+          }
+        }
+      },
+      {
+        "Sid": "DenyExpensiveServices",
+        "Effect": "Deny",
+        "Action": [
+          "ec2:CreateTransitGateway",
+          "ec2:CreateVpnConnection",
+          "directconnect:*",
+          "redshift:CreateCluster",
+          "rds:CreateDBCluster",
+          "sagemaker:CreateEndpoint",
+          "sagemaker:CreateTrainingJob",
+          "shield:CreateSubscription"
+        ],
+        "Resource": "*"
+      }
+    ]
+  }'
+ 
+# Check created SCPs
+aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[].{Name:Name,Id:Id}" --output table
+
+# Export SCP IDs 
+
+export DENYROOTUSER_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='DenyRootUser'].Id" --output text)
+export RESTRICTREGIONS_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='RestrictRegions'].Id" --output text)
+export PROTECTSECURITYSERVICES_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='ProtectSecurityServices'].Id" --output text)
+export PROTECTORGACCESSROLE_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='ProtectOrgAccessRole'].Id" --output text)
+export DENYIAMUSERS_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='DenyIAMUsers'].Id" --output text)
+export SANDBOXGUARDRAILS_POLICYID=$(aws organizations list-policies --filter SERVICE_CONTROL_POLICY --query "Policies[?Name=='SandboxGuardrails'].Id" --output text)
+ 
+# Check exported IDs (none of them should be empty)
+echo $DENYROOTUSER_POLICYID $RESTRICTREGIONS_POLICYID $PROTECTSECURITYSERVICES_POLICYID $PROTECTORGACCESSROLE_POLICYID $DENYIAMUSERS_POLICYID $SANDBOXGUARDRAILS_POLICYID
+
+# Attach SCPs
+
+# Root (inherited by all OUs; the management account is never affected by SCPs)
+aws organizations attach-policy --policy-id $DENYROOTUSER_POLICYID --target-id $ROOT_ID
+aws organizations attach-policy --policy-id $RESTRICTREGIONS_POLICYID --target-id $ROOT_ID
+ 
+# Security OU (these accounts administer the security services, so ProtectSecurityServices is not applied)
+aws organizations attach-policy --policy-id $PROTECTORGACCESSROLE_POLICYID --target-id $OU_SECURITY
+aws organizations attach-policy --policy-id $DENYIAMUSERS_POLICYID --target-id $OU_SECURITY
+ 
+# Infrastructure OU
+aws organizations attach-policy --policy-id $PROTECTSECURITYSERVICES_POLICYID --target-id $OU_INFRASTRUCTURE
+aws organizations attach-policy --policy-id $PROTECTORGACCESSROLE_POLICYID --target-id $OU_INFRASTRUCTURE
+aws organizations attach-policy --policy-id $DENYIAMUSERS_POLICYID --target-id $OU_INFRASTRUCTURE
+ 
+# Workloads OU
+aws organizations attach-policy --policy-id $PROTECTSECURITYSERVICES_POLICYID --target-id $OU_WORKLOADS
+aws organizations attach-policy --policy-id $PROTECTORGACCESSROLE_POLICYID --target-id $OU_WORKLOADS
+aws organizations attach-policy --policy-id $DENYIAMUSERS_POLICYID --target-id $OU_WORKLOADS
+ 
+# Sandbox OU (same as Workloads plus the cost guardrails)
+aws organizations attach-policy --policy-id $PROTECTSECURITYSERVICES_POLICYID --target-id $OU_SANDBOX
+aws organizations attach-policy --policy-id $PROTECTORGACCESSROLE_POLICYID --target-id $OU_SANDBOX
+aws organizations attach-policy --policy-id $DENYIAMUSERS_POLICYID --target-id $OU_SANDBOX
+aws organizations attach-policy --policy-id $SANDBOXGUARDRAILS_POLICYID --target-id $OU_SANDBOX
+ 
+# Check SCPs applied to each target
+echo "Root ($ROOT_ID):"
+aws organizations list-policies-for-target --target-id $ROOT_ID --filter SERVICE_CONTROL_POLICY --query "Policies[].Name" --output table
+echo -e "\nSecurity ($OU_SECURITY):"
+aws organizations list-policies-for-target --target-id $OU_SECURITY --filter SERVICE_CONTROL_POLICY --query "Policies[].Name" --output table
+echo -e "\nInfrastructure ($OU_INFRASTRUCTURE):"
+aws organizations list-policies-for-target --target-id $OU_INFRASTRUCTURE --filter SERVICE_CONTROL_POLICY --query "Policies[].Name" --output table
+echo -e "\nWorkloads ($OU_WORKLOADS):"
+aws organizations list-policies-for-target --target-id $OU_WORKLOADS --filter SERVICE_CONTROL_POLICY --query "Policies[].Name" --output table
+echo -e "\nSandbox ($OU_SANDBOX):"
+aws organizations list-policies-for-target --target-id $OU_SANDBOX --filter SERVICE_CONTROL_POLICY --query "Policies[].Name" --output table
+
+
+# Configure LOG_ARCHIVE account
+export ORG_ID=$(aws organizations describe-organization --query 'Organization.Id' --output text)
+ 
+# Bucket name (the account ID makes it unique)
+export LOG_BUCKET=org-cloudtrail-logs-$ACCOUNT_LOG_ARCHIVE
+
+# Assume OrganizationAccountAccessRole in LOG_ARCHIVE account
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_LOG_ARCHIVE:role/OrganizationAccountAccessRole --role-session-name log-archive --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+ 
+# Verify
+aws sts get-caller-identity
+
+# Setup Log Bucket in LOG ARCHIVE account
+
+# Create the bucket
+aws s3api create-bucket --bucket $LOG_BUCKET
+ 
+# Versioning
+aws s3api put-bucket-versioning --bucket $LOG_BUCKET --versioning-configuration Status=Enabled
+ 
+# Block all public access
+aws s3api put-public-access-block --bucket $LOG_BUCKET --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+ 
+# Default encryption (SSE-S3; can be hardened later with a KMS key)
+aws s3api put-bucket-encryption --bucket $LOG_BUCKET --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+ 
+# Bucket policy: only CloudTrail can write, and only from the Audit account's trail
+cat > /tmp/cloudtrail-bucket-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AWSCloudTrailAclCheck",
+      "Effect": "Allow",
+      "Principal": {"Service": "cloudtrail.amazonaws.com"},
+      "Action": "s3:GetBucketAcl",
+      "Resource": "arn:aws:s3:::$LOG_BUCKET",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:$ACCOUNT_AUDIT:trail/org-trail"
+        }
+      }
+    },
+    {
+      "Sid": "AWSCloudTrailWrite",
+      "Effect": "Allow",
+      "Principal": {"Service": "cloudtrail.amazonaws.com"},
+      "Action": "s3:PutObject",
+      "Resource": [
+        "arn:aws:s3:::$LOG_BUCKET/AWSLogs/$ACCOUNT_AUDIT/*",
+        "arn:aws:s3:::$LOG_BUCKET/AWSLogs/$ORG_ID/*"
+      ],
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceArn": "arn:aws:cloudtrail:us-east-1:$ACCOUNT_AUDIT:trail/org-trail"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonTLS",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::$LOG_BUCKET",
+        "arn:aws:s3:::$LOG_BUCKET/*"
+      ],
+      "Condition": {
+        "Bool": {"aws:SecureTransport": "false"}
+      }
+    }
+  ]
+}
+EOF
+ 
+# Apply the policy
+aws s3api put-bucket-policy --bucket $LOG_BUCKET --policy file:///tmp/cloudtrail-bucket-policy.json
+ 
+# Verify the bucket
+aws s3api get-bucket-policy --bucket $LOG_BUCKET --query Policy --output text
+aws s3api get-bucket-versioning --bucket $LOG_BUCKET
+aws s3api get-public-access-block --bucket $LOG_BUCKET
+
+# Return to management to go into Audit account (can't do that from log archive account)
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+ 
+aws sts get-caller-identity
+
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_AUDIT:role/OrganizationAccountAccessRole --role-session-name audit --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+ 
+# Check that we are in Audit
+aws sts get-caller-identity
+
+# Setup CloudTrail to use Log archive S3 bucket
+
+# Create the trail: organization-wide, multi-region, with log file validation
+aws cloudtrail create-trail --name org-trail --s3-bucket-name $LOG_BUCKET --is-organization-trail --is-multi-region-trail --enable-log-file-validation
+ 
+# Start logging
+aws cloudtrail start-logging --name org-trail
+
+# Verify from Audit account
+aws cloudtrail describe-trails --query 'trailList[].{Name:Name,Bucket:S3BucketName,Org:IsOrganizationTrail,MultiRegion:IsMultiRegionTrail,Validation:LogFileValidationEnabled}' --output table
+aws cloudtrail get-trail-status --name org-trail --query '{Logging:IsLogging,LastError:LatestDeliveryError}' --output table
+
+# Back to management account
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+ 
+aws sts get-caller-identity
+
+
+# Setup AWS Config baseline as follows:
+#
+# Log Archive -> stores the Config snapshots/history (bucket)
+# Shared      -> deploys the Config recorder + delivery channel to every
+#                account through a service-managed StackSet
+#                (it is the delegated administrator for StackSets)
+# Management  -> not covered by service-managed StackSets, so it gets its
+#                own stack
+
+# In Management account
+export ORG_ID=$(aws organizations describe-organization --query 'Organization.Id' --output text)
+
+# Bucket name (the account ID makes it unique)
+export CONFIG_BUCKET=org-config-logs-$ACCOUNT_LOG_ARCHIVE
+
+# Template deployed to every account: IAM role + recorder + delivery channel
+# (quoted 'EOF' so the shell does not touch anything inside the template)
+cat > /tmp/config-baseline.json <<'EOF'
+{
+  "AWSTemplateFormatVersion": "2010-09-09",
+  "Description": "AWS Config baseline: recorder and delivery channel",
+  "Parameters": {
+    "ConfigBucketName": {
+      "Type": "String"
+    }
+  },
+  "Resources": {
+    "ConfigRole": {
+      "Type": "AWS::IAM::Role",
+      "Properties": {
+        "AssumeRolePolicyDocument": {
+          "Version": "2012-10-17",
+          "Statement": [
+            {
+              "Effect": "Allow",
+              "Principal": {"Service": "config.amazonaws.com"},
+              "Action": "sts:AssumeRole"
+            }
+          ]
+        },
+        "ManagedPolicyArns": [
+          "arn:aws:iam::aws:policy/service-role/AWS_ConfigRole"
+        ]
+      }
+    },
+    "DeliveryChannel": {
+      "Type": "AWS::Config::DeliveryChannel",
+      "Properties": {
+        "Name": "default",
+        "S3BucketName": {"Ref": "ConfigBucketName"}
+      }
+    },
+    "ConfigRecorder": {
+      "Type": "AWS::Config::ConfigurationRecorder",
+      "DependsOn": "DeliveryChannel",
+      "Properties": {
+        "Name": "default",
+        "RoleARN": {"Fn::GetAtt": ["ConfigRole", "Arn"]},
+        "RecordingGroup": {
+          "AllSupported": true,
+          "IncludeGlobalResourceTypes": true
+        }
+      }
+    }
+  }
+}
+EOF
+
+# Assume role in LOG_ARCHIVE account
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_LOG_ARCHIVE:role/OrganizationAccountAccessRole --role-session-name log-archive --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+ 
+# Verify
+aws sts get-caller-identity
+
+# Setup S3 bucket in LOG_ARCHIVE account for AWS Config
+aws s3api create-bucket --bucket $CONFIG_BUCKET
+ 
+# Versioning
+aws s3api put-bucket-versioning --bucket $CONFIG_BUCKET --versioning-configuration Status=Enabled
+ 
+# Block all public access
+aws s3api put-public-access-block --bucket $CONFIG_BUCKET --public-access-block-configuration BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true
+ 
+# Default encryption (SSE-S3; can be hardened later with a KMS key)
+aws s3api put-bucket-encryption --bucket $CONFIG_BUCKET --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
+ 
+# Bucket policy: only AWS Config from accounts of this organization can write
+cat > /tmp/config-bucket-policy.json <<EOF
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "AWSConfigBucketPermissionsCheck",
+      "Effect": "Allow",
+      "Principal": {"Service": "config.amazonaws.com"},
+      "Action": ["s3:GetBucketAcl", "s3:ListBucket"],
+      "Resource": "arn:aws:s3:::$CONFIG_BUCKET",
+      "Condition": {
+        "StringEquals": {
+          "aws:SourceOrgID": "$ORG_ID"
+        }
+      }
+    },
+    {
+      "Sid": "AWSConfigBucketDelivery",
+      "Effect": "Allow",
+      "Principal": {"Service": "config.amazonaws.com"},
+      "Action": "s3:PutObject",
+      "Resource": "arn:aws:s3:::$CONFIG_BUCKET/AWSLogs/*/Config/*",
+      "Condition": {
+        "StringEquals": {
+          "s3:x-amz-acl": "bucket-owner-full-control",
+          "aws:SourceOrgID": "$ORG_ID"
+        }
+      }
+    },
+    {
+      "Sid": "DenyNonTLS",
+      "Effect": "Deny",
+      "Principal": "*",
+      "Action": "s3:*",
+      "Resource": [
+        "arn:aws:s3:::$CONFIG_BUCKET",
+        "arn:aws:s3:::$CONFIG_BUCKET/*"
+      ],
+      "Condition": {
+        "Bool": {"aws:SecureTransport": "false"}
+      }
+    }
+  ]
+}
+EOF
+ 
+# Apply the policy
+aws s3api put-bucket-policy --bucket $CONFIG_BUCKET --policy file:///tmp/config-bucket-policy.json
+ 
+# Verify the bucket
+aws s3api get-bucket-policy --bucket $CONFIG_BUCKET --query Policy --output text
+aws s3api get-bucket-versioning --bucket $CONFIG_BUCKET
+aws s3api get-public-access-block --bucket $CONFIG_BUCKET
+
+# Return to Management account
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+ 
+aws sts get-caller-identity
+
+# Activate trusted access for service-managed StackSets (in management account only)
+aws cloudformation activate-organizations-access
+ 
+# Verify: stacksets.cloudformation.amazonaws.com must appear in the list
+aws organizations list-aws-service-access-for-organization --query "EnabledServicePrincipals[?ServicePrincipal=='stacksets.cloudformation.amazonaws.com']" --output table
+
+# IN FLOCI THE StackSets CREATION DOESN'T WORK AS EXPECTED SO IT'S NEEDED TO USE THE MANAGEMENT ACCOUNT INSTEAD:
+# aws cloudformation create-stack-set --stack-set-name config-baseline --template-body file:///tmp/config-baseline.json --parameters ParameterKey=ConfigBucketName,ParameterValue=$CONFIG_BUCKET --capabilities CAPABILITY_IAM --permission-model SERVICE_MANAGED --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false
+# aws cloudformation create-stack-instances --stack-set-name config-baseline --deployment-targets OrganizationalUnitIds=$OU_SECURITY,$OU_INFRASTRUCTURE,$OU_WORKLOADS,$OU_SANDBOX --regions us-east-1
+# aws cloudformation list-stack-set-operations --stack-set-name config-baseline --query 'Summaries[].{Action:Action,Status:Status}' --output table
+# aws cloudformation list-stack-instances --stack-set-name config-baseline --query 'Summaries[].{Account:Account,Region:Region,Status:Status}' --output table
+
+# From Shared account run the stacksets
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_SHARED:role/OrganizationAccountAccessRole --role-session-name shared --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+ 
+# Check that we are in Shared
+aws sts get-caller-identity
+
+# Create the StackSet. SERVICE_MANAGED = deployed to OUs through Organizations.
+# Auto-deployment makes accounts created later in those OUs get the baseline.
+aws cloudformation create-stack-set --stack-set-name config-baseline --template-body file:///tmp/config-baseline.json --parameters ParameterKey=ConfigBucketName,ParameterValue=$CONFIG_BUCKET --capabilities CAPABILITY_IAM --permission-model SERVICE_MANAGED --auto-deployment Enabled=true,RetainStacksOnAccountRemoval=false --call-as DELEGATED_ADMIN
+ 
+# Deploy to the accounts that already exist in the four OUs
+aws cloudformation create-stack-instances --stack-set-name config-baseline --deployment-targets OrganizationalUnitIds=$OU_SECURITY,$OU_INFRASTRUCTURE,$OU_WORKLOADS,$OU_SANDBOX --regions us-east-1 --call-as DELEGATED_ADMIN
+
+# Verify
+aws cloudformation list-stack-set-operations --stack-set-name config-baseline --query 'Summaries[].{Action:Action,Status:Status}' --output table
+aws cloudformation list-stack-instances --stack-set-name config-baseline --query 'Summaries[].{Account:Account,Region:Region,Status:Status}' --output table
+
+# Verify in other account that AWS Config is set properly
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_AUDIT:role/OrganizationAccountAccessRole --role-session-name audit --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+
+aws configservice describe-configuration-recorders
+aws configservice describe-configuration-recorder-status
+aws configservice describe-delivery-channels
+
+# Set AWS Config in management account with its own stack
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+ 
+aws sts get-caller-identity
+ 
+aws cloudformation create-stack --stack-name config-baseline --template-body file:///tmp/config-baseline.json --parameters ParameterKey=ConfigBucketName,ParameterValue=$CONFIG_BUCKET --capabilities CAPABILITY_IAM
+ 
+# Wait until the status is CREATE_COMPLETE
+aws cloudformation describe-stacks --stack-name config-baseline --query 'Stacks[0].StackStatus' --output text
+ 
+# Verify Config in the management account
+aws configservice describe-configuration-recorders
+aws configservice describe-configuration-recorder-status
+aws configservice describe-delivery-channels
+
+# Setup Config Aggregator and Access Analyzer
+
+
+CREDS=$(aws sts assume-role --role-arn arn:aws:iam::$ACCOUNT_AUDIT:role/OrganizationAccountAccessRole --role-session-name audit --query 'Credentials.[AccessKeyId,SecretAccessKey,SessionToken]' --output text)
+export AWS_ACCESS_KEY_ID=$(echo $CREDS | awk '{print $1}')
+export AWS_SECRET_ACCESS_KEY=$(echo $CREDS | awk '{print $2}')
+export AWS_SESSION_TOKEN=$(echo $CREDS | awk '{print $3}')
+ 
+# Check that we are in Audit
+aws sts get-caller-identity
+ 
+# Create the role (trusted by the AWS Config service)
+aws iam create-role --role-name ConfigAggregatorRole --assume-role-policy-document '{"Version":"2012-10-17","Statement":[{"Effect":"Allow","Principal":{"Service":"config.amazonaws.com"},"Action":"sts:AssumeRole"}]}'
+ 
+# Managed policy that allows reading the organization structure
+aws iam attach-role-policy --role-name ConfigAggregatorRole --policy-arn arn:aws:iam::aws:policy/service-role/AWSConfigRoleForOrganizations
+ 
+# Verify the role
+aws iam get-role --role-name ConfigAggregatorRole --query 'Role.Arn' --output text
+aws iam list-attached-role-policies --role-name ConfigAggregatorRole --query 'AttachedPolicies[].PolicyName' --output table
+ 
+ 
+###############################################################################
+# 3. Config organization aggregator
+###############################################################################
+ 
+# Aggregate every account of the organization, only in us-east-1
+aws configservice put-configuration-aggregator --configuration-aggregator-name org-aggregator --organization-aggregation-source RoleArn=arn:aws:iam::$ACCOUNT_AUDIT:role/ConfigAggregatorRole,AwsRegions=us-east-1,AllAwsRegions=false
+ 
+# Verify the aggregator
+aws configservice describe-configuration-aggregators --query 'ConfigurationAggregators[].{Name:ConfigurationAggregatorName,Arn:ConfigurationAggregatorArn}' --output table
+ 
+# Verify that the sources (accounts) are being collected
+# Expected: LastUpdateStatus SUCCEEDED (it can take a few minutes in real AWS)
+aws configservice describe-configuration-aggregator-sources-status --configuration-aggregator-name org-aggregator --query 'AggregatedSourceStatusList[].{Source:SourceId,Region:AwsRegion,Status:LastUpdateStatus}' --output table
+ 
+ 
+###############################################################################
+# 4. Access Analyzer: organization analyzer
+#    Zone of trust = the whole organization. Findings = access from outside it
+###############################################################################
+ 
+aws accessanalyzer create-analyzer --analyzer-name org-analyzer --type ORGANIZATION
+ 
+# Verify the analyzer
+aws accessanalyzer list-analyzers --query 'analyzers[].{Name:name,Type:type,Status:status}' --output table
+ 
+# List findings (empty at the beginning is normal)
+export ANALYZER_ARN=$(aws accessanalyzer list-analyzers --query "analyzers[?name=='org-analyzer'].arn" --output text)
+aws accessanalyzer list-findings-v2 --analyzer-arn $ANALYZER_ARN --query 'findings[].{Resource:resource,Type:resourceType,Status:status}' --output table
+ 
+ 
+###############################################################################
+# 5. Go back to MANAGEMENT (Floci: key and secret are "test", no session token)
+###############################################################################
+ 
+export AWS_ACCESS_KEY_ID=test
+export AWS_SECRET_ACCESS_KEY=test
+unset AWS_SESSION_TOKEN
+ 
+aws sts get-caller-identity

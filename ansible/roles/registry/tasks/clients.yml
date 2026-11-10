@@ -1,0 +1,53 @@
+---
+- name: Add registry name to node host resolution
+  ansible.builtin.lineinfile:
+    path: /etc/hosts
+    regexp: "^{{ registry_address | regex_escape }}\\s+{{ registry_hostname | regex_escape }}(\\s|$)"
+    line: "{{ registry_address }} {{ registry_hostname }}"
+    state: present
+
+- name: Create containerd registry configuration directory
+  ansible.builtin.file:
+    path: "/etc/containerd/certs.d/{{ registry_hostname }}:{{ registry_port }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "0755"
+
+- name: Verify registry HTTP reachability from each Kubernetes node
+  ansible.builtin.uri:
+    url: "http://{{ registry_hostname }}:{{ registry_port }}/v2/"
+    method: GET
+    status_code: 200
+  register: registry_client_check
+  retries: 10
+  delay: 3
+  until: registry_client_check.status == 200
+
+- name: Configure containerd HTTP registry endpoint
+  ansible.builtin.copy:
+    dest: "/etc/containerd/certs.d/{{ registry_hostname }}:{{ registry_port }}/hosts.toml"
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      server = "http://{{ registry_hostname }}:{{ registry_port }}"
+
+      [host."http://{{ registry_hostname }}:{{ registry_port }}"]
+        capabilities = ["pull", "resolve"]
+
+- name: Enable containerd per-registry configuration
+  ansible.builtin.blockinfile:
+    path: /etc/containerd/config.toml
+    insertafter: '^\[plugins\."io\.containerd\.grpc\.v1\.cri"\]$'
+    marker: "# {mark} ANSIBLE MANAGED REGISTRY CONFIG"
+    block: |
+      [plugins."io.containerd.grpc.v1.cri".registry]
+        config_path = "/etc/containerd/certs.d"
+  register: containerd_registry_config
+
+- name: Restart containerd to load registry configuration
+  ansible.builtin.systemd:
+    name: containerd
+    state: restarted
+  when: containerd_registry_config.changed

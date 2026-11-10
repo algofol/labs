@@ -1,0 +1,11 @@
+#!/usr/bin/env xdg-open
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=start_floci
+Comment=run start_floci.sh in a terminal
+Exec=gnome-terminal -- bash -c 'cd "$HOME/Desktop" && sudo bash ./start_floci_dash.sh; echo; echo "Hit Enter to close."; read'
+Icon=utilities-terminal
+Terminal=false
+Categories=Development;
+

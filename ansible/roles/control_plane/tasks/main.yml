@@ -1,0 +1,57 @@
+---
+- name: Initialize Kubernetes control plane
+  ansible.builtin.command:
+    cmd: >-
+      kubeadm init
+      --apiserver-advertise-address={{ kubernetes_control_plane_address }}
+      --pod-network-cidr={{ kubernetes_pod_network_cidr }}
+    creates: /etc/kubernetes/admin.conf
+  register: kubeadm_init
+
+- name: Allow Kubernetes API server access
+  ansible.builtin.command:
+    cmd: firewall-cmd --permanent --add-port=6443/tcp
+  register: api_firewall_rule
+  changed_when: "'ALREADY_ENABLED' not in api_firewall_rule.stdout"
+
+- name: Reload firewall after allowing Kubernetes API server access
+  ansible.builtin.command:
+    cmd: firewall-cmd --reload
+  when: api_firewall_rule.changed
+  changed_when: true
+
+- name: Look up the Ansible user's home directory
+  ansible.builtin.getent:
+    database: passwd
+    key: "{{ ansible_user }}"
+
+- name: Create kubeconfig directory for the Ansible user
+  ansible.builtin.file:
+    path: "{{ ansible_facts['getent_passwd'][ansible_user][4] }}/.kube"
+    state: directory
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0755"
+
+- name: Copy administrator kubeconfig for the Ansible user
+  ansible.builtin.copy:
+    src: /etc/kubernetes/admin.conf
+    dest: "{{ ansible_facts['getent_passwd'][ansible_user][4] }}/.kube/config"
+    remote_src: true
+    owner: "{{ ansible_user }}"
+    group: "{{ ansible_user }}"
+    mode: "0600"
+
+- name: Generate worker join command
+  ansible.builtin.command:
+    cmd: kubeadm token create --print-join-command
+  register: worker_join_command
+  changed_when: false
+
+- name: Store worker join command for later plays
+  ansible.builtin.set_fact:
+    kubernetes_worker_join_command: "{{ worker_join_command.stdout | trim }}"
+
+- name: Display worker join command
+  ansible.builtin.debug:
+    msg: "{{ worker_join_command.stdout }}"

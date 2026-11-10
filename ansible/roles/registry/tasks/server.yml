@@ -1,0 +1,96 @@
+---
+- name: Install registry host dependencies
+  ansible.builtin.dnf:
+    name:
+      - firewalld
+      - podman
+    state: present
+
+- name: Enable and start firewalld
+  ansible.builtin.systemd:
+    name: firewalld
+    enabled: true
+    state: started
+
+- name: Create registry directories
+  ansible.builtin.file:
+    path: "{{ item.path }}"
+    state: directory
+    owner: root
+    group: root
+    mode: "{{ item.mode }}"
+  loop:
+    - { path: "{{ registry_storage_dir }}", mode: "0750" }
+    - { path: /etc/containers/systemd, mode: "0755" }
+
+- name: Remove obsolete registry authentication configuration
+  ansible.builtin.file:
+    path: "{{ registry_config_dir }}/auth"
+    state: absent
+
+- name: Check whether registry traffic is already allowed
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - "--query-port={{ registry_port }}/tcp"
+  register: registry_firewall_query
+  changed_when: false
+
+- name: Allow registry traffic through firewalld
+  ansible.builtin.command:
+    argv:
+      - firewall-cmd
+      - --permanent
+      - "--add-port={{ registry_port }}/tcp"
+  register: registry_firewall_rule
+  when: registry_firewall_query.rc != 0
+  changed_when: true
+
+- name: Reload firewalld after allowing registry traffic
+  ansible.builtin.command:
+    cmd: firewall-cmd --reload
+  when: registry_firewall_rule.changed
+  changed_when: true
+
+- name: Install registry Quadlet service definition
+  ansible.builtin.copy:
+    dest: /etc/containers/systemd/registry.container
+    owner: root
+    group: root
+    mode: "0644"
+    content: |
+      [Unit]
+      Description=Private OCI image registry
+      After=network-online.target
+      Wants=network-online.target
+
+      [Container]
+      Image={{ registry_image }}
+      ContainerName=private-registry
+      PublishPort={{ registry_address }}:{{ registry_port }}:5000
+      Volume={{ registry_storage_dir }}:/var/lib/registry:Z
+      Environment=OTEL_TRACES_EXPORTER=none
+
+      [Service]
+      Restart=always
+      TimeoutStartSec=900
+
+      [Install]
+      WantedBy=multi-user.target
+  register: registry_quadlet
+
+- name: Start registry service
+  ansible.builtin.systemd:
+    name: registry.service
+    daemon_reload: true
+    state: "{{ 'restarted' if registry_quadlet.changed else 'started' }}"
+
+- name: Verify open registry API over HTTP
+  ansible.builtin.uri:
+    url: "http://{{ registry_hostname }}:{{ registry_port }}/v2/"
+    method: GET
+    status_code: 200
+  register: registry_api_check
+  retries: 10
+  delay: 3
+  until: registry_api_check.status == 200

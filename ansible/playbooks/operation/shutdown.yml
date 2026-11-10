@@ -1,0 +1,13 @@
+---
+- name: Apagar nodos Kubernetes
+  hosts: kube_cluster
+  become: true
+
+  tasks:
+    - name: Apagar nodo
+      ansible.builtin.command:
+        cmd: shutdown -h now
+      async: 1
+      poll: 0
+      ignore_errors: true
+      ignore_unreachable: true
