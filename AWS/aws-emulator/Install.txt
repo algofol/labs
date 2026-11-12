@@ -1,0 +1,32 @@
+# Install
+sudo dnf install -y https://downloads.aws.com/aws-emulator/packages/aws-emulator/LTS/latest/aws-emulator-x86_64.rpm
+
+# Verify
+aws-emulator -v
+# Version: 1.0.322
+# Release date: 2026.11.10
+# Commit: 7753983c6e495ec3612695b1336bf4936fc7b7fd
+
+# Start emulator
+aws-emulator &
+
+# Stop emulator
+fg 1 + Ctrl-c
+
+# Connect to the environment
+export AWS_ENDPOINT_URL=https://127.0.0.1:9297
+export AWS_SHARED_CREDENTIALS_FILE=~/.aws/emulator/9297/emulator_credentials
+export AWS_CONFIG_FILE=~/.aws/emulator/9297/config
+export AWS_CA_BUNDLE=~/.aws/emulator/9297/ca.pem
+export AWS_EC2_METADATA_DISABLED=true
+export AWS_DISABLE_HOST_PREFIX_INJECTION=true
+export AWS_REGION=us-east-1
+export AWS_DEFAULT_REGION=us-east-1
+
+# Verify
+aws sts get-caller-identity 
+#{
+#    "UserId": "AIDAH5I7GEMO7ADXNFAZU",
+#    "Account": "000000000000",
+#    "Arn": "arn:aws:iam::000000000000:user/emulator"
+#}

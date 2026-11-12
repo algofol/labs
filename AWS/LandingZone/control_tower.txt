@@ -239,3 +239,42 @@ export SANDBOX_OU_ID=$(aws organizations list-organizational-units-for-parent --
 #aws organizations move-account --account-id $LOG_ID --source-parent-id $ROOT_ID --destination-parent-id $SECURITY_OU_ID
 #aws organizations move-account --account-id $AUDIT_ID --source-parent-id $ROOT_ID --destination-parent-id $SECURITY_OU_ID
 #aws organizations list-accounts-for-parent --parent-id $SECURITY_OU_ID --query "Accounts[].[Name,Id]" --output table
+
+
+# Enable controls, first get Sandbox and Securitu OU's ARNs
+export SANDBOX_OU_ARN=$(aws organizations describe-organizational-unit --organizational-unit-id $SANDBOX_OU_ID --query "OrganizationalUnit.Arn" --output text)
+export SECURITY_OU_ARN=$(aws organizations describe-organizational-unit --organizational-unit-id $SECURITY_OU_ID --query "OrganizationalUnit.Arn" --output text)
+
+# Check which controls ar currently enabled(empty on Floci,but with some default controls on real environment)
+aws controltower list-enabled-controls --target-identifier $SECURITY_OU_ARN
+aws controltower list-enabled-controls --target-identifier $SANDBOX_OU_ARN
+
+# List available controls (Floci has only 6, real AWS has hundreds)
+aws controlcatalog list-controls --query "Controls[].[Name,Arn,Behavior]" --output table
+
+# Three types of controls:
+# Preventive - with SCPs, blocks action before happens
+# Detective - with AWS Config rules, doesn't block but marks as non-compliant
+# Proactive - with CloudFormation Hooks, rejects a deployment if a rule is not satisfied
+# We Will take two examples:
+# |  Detect whether EBS volumes are encrypted     |  arn:aws:controlcatalog:::control/503uicglhjkokaajywfpt6ros  |  DETECTIVE  |
+# |  Require encryption in transit for Amazon S3  |  arn:aws:controlcatalog:::control/7mo7a2h2ebsq71l8k6uzr96ou  |  PREVENTIVE |
+
+#export CTRL_EBS_ARN=arn:aws:controlcatalog:::control/503uicglhjkokaajywfpt6ros
+#export CTRL_S3_TLS_ARN=arn:aws:controlcatalog:::control/7mo7a2h2ebsq71l8k6uzr96ou
+#aws controlcatalog get-control --control-arn $CTRL_S3_TLS_ARN
+
+# Enable preventive control in Sandbox Account
+#aws controltower enable-control --control-identifier $CTRL_S3_TLS_ARN --target-identifier $SANDBOX_OU_ARN
+
+# Enable detctive control in Sandbox account
+#aws controltower enable-control --control-identifier $CTRL_EBS_ARN --target-identifier $SANDBOX_OU_ARN
+
+# Verify Enabled controls
+#aws controltower list-enabled-controls --target-identifier $SANDBOX_OU_ARN --query "enabledControls[].[controlIdentifier,statusSummary.status,driftStatusSummary.driftStatus]" --output table
+#----------------------------------------------------------------------------------------
+#|                                  ListEnabledControls                                 |
+#+-------------------------------------------------------------+------------+-----------+
+#|  arn:aws:controlcatalog:::control/7mo7a2h2ebsq71l8k6uzr96ou |  SUCCEEDED |  IN_SYNC  |
+#|  arn:aws:controlcatalog:::control/503uicglhjkokaajywfpt6ros |  SUCCEEDED |  IN_SYNC  |
+#+-------------------------------------------------------------+------------+-----------+
